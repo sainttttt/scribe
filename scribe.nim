@@ -2,17 +2,30 @@ import std/[strutils, streams, os, osproc,
             strformat, times, paths, math]
 import print
 import xxhash
+import argparse
+
 import db_connector/db_sqlite
 
 
-let seed = 153.uint64
+# seed used for xxhash - need this seed
+# for hashes to be reproducable with another client
+const seed = 153.uint64
 
-let scribeDir = (if paramCount() > 0 : paramStr(1) else: "./")
+# this limits the number of saves that we store
+# a save is a list of all the files on the system.
+# we want to do saves often so we have a list of what's
+# currently on the system but it takes up a lot of space
+# so we have a rolling buffer thing
+const numSaves = 3
 
-let dbPath = fmt"{scribeDir}/.scribe2.db"
-let db = open(dbPath, "", "", "")
+var db: DbConn
 
-proc initDb(): void =
+proc initDb(path: string): void =
+
+  let dbPath = fmt"{path}/.scribe.db"
+  db = open(dbPath, "", "", "")
+
+  # schema
   db.exec(sql"""CREATE TABLE IF NOT EXISTS hashes
                       (name TEXT, filesize INTEGER, hash TEXT, date TEXT)""")
 
@@ -37,6 +50,8 @@ proc initDb(): void =
 
 
 proc shouldIgnore(path: string): bool =
+  # files that we ignore, add more stuff here if needed
+  # we are not hashing hidden folders for now, I guess that's okay
   let ignorePaths = @[".scribe", ".vim", ".git", "."]
   for pathPart in path.split('/'):
 
@@ -52,9 +67,21 @@ proc shouldIgnore(path: string): bool =
   return false
 
 
+# so this is what chunk size we use to do the streaming
+# segmented hash thing. This number seems to be tweakable
+# and there seems to be a sweet spot for speed, too small
+# or too large affects the speed. Idk if this is the right
+# approach or what
+
+# Also I wanted to optimize it by not creating a newString
+# but there was a bug, the hash works but it varies each time
+# you call it, so something is not right. I think the speed increase
+# is extremely minimal so it's not worth it. Was just doing it for
+# fun really
+
 const chunkSize = 2 ^ 17
-var buffer = newSeqUninitialized[uint8](chunkSize)
-# var buffer = newString(chunkSize)
+# var buffer = newSeqUninitialized[uint8](chunkSize)
+var buffer = newString(chunkSize)
 
 proc streamingHash(path: string): string =
   var fs = newFileStream(path, fmRead)
@@ -64,9 +91,9 @@ proc streamingHash(path: string): string =
   var size: int
 
   while not fs.atEnd:
-    # fs.readStr(chunkSize, buffer)
-    let size = fs.readData(addr(buffer[0]), chunkSize - 1)
-    buffer[size] = 0
+    fs.readStr(chunkSize, buffer)
+    # let size = fs.readData(addr(buffer[0]), chunkSize - 1)
+    # buffer[size] = 0
 
     state.update(cast[string](buffer))
 
@@ -75,33 +102,43 @@ proc streamingHash(path: string): string =
 
 
 var insertCount = 0
-let COMMIT_RATE = 150
 
+# How often we should commit to the database
+# We sort of have to handroll the whole transaction thing here
+# instead of how python does it. Anyways this does affect the speed
+# a lot so this number can be tweaked, actually the larger the better
+# probably
+let COMMIT_RATE = 1000
+
+# this is the date format for sqlite too although we aren't really
+# using the date format features in it yet
 var dateStr = now().format("yyyy-MM-dd' 'HH:mm:ss")
+
 var count = 0
 var txStarted = false
-proc hashFiles() =
-  for p in walkDirRec(scribeDir & "/"):
 
+proc hashFiles(rootPath: string) =
+  for p in walkDirRec(rootPath & "/"):
     if p.shouldIgnore:
       continue
 
     let path = p.normalizedPath
-    insertCount += 1
-    # if insertCount mod 1000 == 0:
-    #   print path
 
     let filesize = path.getFileSize
-
     let fetchedSize = db.getValue(sql"""SELECT filesize FROM files
                                       WHERE name = ? ORDER BY date
                                       DESC LIMIT 1""", path)
 
-
     var hash = ""
+    # check filesizes first, if there is no previously stored filesize
+    # or the filesizes don't match then hash
     if fetchedSize.len == 0 or fetchedSize.parseInt != filesize:
       hash = streamingHash(path)
+      print path, hash
 
+    # we have to handroll the transaction stuff
+    # in the future we should be able to make some sort of nim macro to
+    # handle this
     if not txStarted:
       db.exec(sql"BEGIN")
       txStarted = true
@@ -117,42 +154,74 @@ proc hashFiles() =
                  path,filesize, dateStr, hash)
     count += 1
 
-    if count mod 300 == 0:
+    if count mod COMMIT_RATE == 0:
+      print path
       db.exec(sql"COMMIT")
-      print "commit"
       txStarted = false
       count = 0
 
-    # print path
-    # print hash
+  # more of the sqlite transaction handroll
   if txStarted:
     db.exec(sql"COMMIT")
 
-proc checkFiles() =
+
+  # this is the rolling buffer of how many saves we allow
+  db.exec(sql"""DELETE FROM files WHERE date IN
+          (SELECT DISTINCT date FROM files
+           ORDER BY date DESC limit -1 offset ?)""",
+              numSaves)
+
+
+proc checkFiles(checkHash = false) =
+  var errors = false
   let lastTime = db.getValue(sql"""SELECT date FROM files
                                     ORDER BY date
                                     DESC LIMIT 1""")
 
-  for row in db.rows(sql"SELECT files.name, hashes.hash FROM files JOIN hashes ON files.name = hashes.name WHERE files.date = ?", lastTime):
+
+  # this first part checks if there are missing files or not only
+  for row in db.rows(sql"SELECT name FROM files WHERE date = ?", lastTime):
     if not row[0].fileExists:
-      print "not found"
-      print row[0], row[1]
+      echo fmt"not found: {row[0].normalizedPath}"
+      errors = true
     else:
-      let newHash = streamingHash(row[0])
-      print newHash, row[1]
-      if newHash == row[1]:
-        print "match"
-      else:
-        print row[0]
-        print "no match ERROROROROROR"
-        discard readline stdin
+
+      # this does a hashcheck on each found file
+      if checkHash:
+        let firstHash = db.getValue(sql"""SELECT hash FROM hashes
+                                    WHERE name = ?
+                                          ORDER BY date
+                                          ASC LIMIT 1""", row[0])
+
+        let newHash = streamingHash(row[0])
+
+        if newHash != firstHash:
+          echo fmt"hash miss: {row[0]}, stored: {firstHash}, calc: {newHash}"
+          errors = true
+  if not errors:
+    echo "all checks good"
 
 
+var p = newParser:
+  flag("-hs", "--hash", help="Run a full hash calculation")
+  flag("-cf", "--check-files",  help="Check if files are missing from the last save")
+  flag("-ch", "--check-hashes", help="Check all the hashes of the last save to the specified destination")
+  arg("path")
+  arg("others", nargs = -1)
 
 
+try:
+  var opts = p.parse(commandLineParams())
+  initDb(opts.path)
+  if opts.hash: hashFiles(opts.path)
+  elif opts.check_files: checkFiles(opts.check_hashes)
+  elif opts.check_hashes: checkFiles(opts.check_hashes)
+  db.close()
 
-
-initDb()
-# hashFiles()
-# checkFiles()
-db.close()
+except ShortCircuit as err:
+  if err.flag == "argparse_help":
+    echo err.help
+    quit(1)
+except UsageError:
+  stderr.writeLine getCurrentExceptionMsg()
+  quit(1)
