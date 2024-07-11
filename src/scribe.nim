@@ -171,6 +171,12 @@ proc hashFiles(rootPath: string) =
            ORDER BY date DESC limit -1 offset ?)""",
               numSaves)
 
+  # this removes entries from hashes that aren't in any
+  # of the saves
+  db.exec(sql"""DELETE FROM hashes WHERE name IN
+          (SELECT hashes.name from HASHES
+          LEFT JOIN files ON hashes.name = files.name
+          WHERE files.name IS NULL)""")
 
 proc checkFiles(checkHash = false) =
   var errors = false
@@ -222,6 +228,3 @@ except ShortCircuit as err:
   if err.flag == "argparse_help":
     echo err.help
     quit(1)
-except UsageError:
-  stderr.writeLine getCurrentExceptionMsg()
-  quit(1)
