@@ -1,7 +1,8 @@
 import std/[strutils, streams, os, osproc,
             strformat, times, paths, math]
+
 import print
-import xxhash
+import hannah
 import argparse
 
 import db_connector/db_sqlite
@@ -67,40 +68,6 @@ proc shouldIgnore(path: string): bool =
   return false
 
 
-# so this is what chunk size we use to do the streaming
-# segmented hash thing. This number seems to be tweakable
-# and there seems to be a sweet spot for speed, too small
-# or too large affects the speed. Idk if this is the right
-# approach or what
-
-# Also I wanted to optimize it by not creating a newString
-# but there was a bug, the hash works but it varies each time
-# you call it, so something is not right. I think the speed increase
-# is extremely minimal so it's not worth it. Was just doing it for
-# fun really
-
-const chunkSize = 2 ^ 17
-# var buffer = newSeqUninitialized[uint8](chunkSize)
-var buffer = newString(chunkSize)
-
-proc streamingHash(path: string): string =
-  var fs = newFileStream(path, fmRead)
-  defer: fs.close()
-
-  var state = newXxh3_64(seed)
-  var size: int
-
-  while not fs.atEnd:
-    fs.readStr(chunkSize, buffer)
-    # let size = fs.readData(addr(buffer[0]), chunkSize - 1)
-    # buffer[size] = 0
-
-    state.update(cast[string](buffer))
-
-  return state.digest().toHex.toLowerAscii
-
-
-
 var insertCount = 0
 
 # How often we should commit to the database
@@ -133,7 +100,7 @@ proc hashFiles(rootPath: string) =
     # check filesizes first, if there is no previously stored filesize
     # or the filesizes don't match then hash
     if fetchedSize.len == 0 or fetchedSize.parseInt != filesize:
-      hash = streamingHash(path)
+      hash = streamingHashXxH3_64(path, seed)
       print path, hash
 
     # we have to handroll the transaction stuff
@@ -199,7 +166,7 @@ proc checkFiles(checkHash = false) =
                                           ORDER BY date
                                           ASC LIMIT 1""", row[0])
 
-        let newHash = streamingHash(row[0])
+        let newHash = streamingHashXxH3_64(row[0], seed)
 
         if newHash != firstHash:
           echo fmt"hash miss: {row[0]}, stored: {firstHash}, calc: {newHash}"
@@ -215,6 +182,7 @@ var p = newParser:
   arg("path")
   arg("others", nargs = -1)
 
+print "starting"
 
 try:
   var opts = p.parse(commandLineParams())
